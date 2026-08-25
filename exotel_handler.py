@@ -73,23 +73,27 @@ class ExotelHandler:
             '</Response>'
         )
 
-    async def send_audio_chunks(self, websocket, stream_sid: str, mulaw_audio: bytes):
-        """Stream native 8kHz μ-law audio chunks directly to Exotel."""
-        if not mulaw_audio:
+    async def send_audio_chunks(self, websocket, stream_sid: str, audio_bytes: bytes, audio_format: str = "mulaw"):
+        """Stream telephony audio chunks directly to Exotel."""
+        if not audio_bytes:
+            return
+        if not stream_sid:
+            logger.warning("[MEDIA_OUT] Cannot stream audio without stream_sid.")
             return
 
         self._is_speaking = True
         try:
-            chunk_size = 320  # 320 bytes = 40ms at 8000Hz 8-bit mono
-            total_chunks = (len(mulaw_audio) + chunk_size - 1) // chunk_size
-            logger.info(f"[MEDIA_OUT] Streaming {len(mulaw_audio)} bytes native μ-law ({total_chunks} chunks) to stream: {stream_sid}")
+            chunk_size = 640 if audio_format == "pcm8" else 320
+            total_chunks = (len(audio_bytes) + chunk_size - 1) // chunk_size
+            logger.info(f"[MEDIA_OUT] Streaming {len(audio_bytes)} bytes {audio_format} ({total_chunks} chunks) to stream: {stream_sid}")
 
-            for i in range(0, len(mulaw_audio), chunk_size):
-                chunk = mulaw_audio[i:i + chunk_size]
+            for i in range(0, len(audio_bytes), chunk_size):
+                chunk = audio_bytes[i:i + chunk_size]
                 payload = base64.b64encode(chunk).decode("utf-8")
                 msg = {
                     "event": "media",
-                    "streamSid": stream_sid or "",
+                    "stream_sid": stream_sid,
+                    "streamSid": stream_sid,
                     "media": {
                         "payload": payload
                     }
@@ -112,7 +116,8 @@ class ExotelHandler:
         logger.info(f"============================================================")
 
         stream_sid = None
-        mulaw_audio_buffer = b""
+        audio_buffer = b""
+        audio_format = "mulaw"
         speech_started = False
         silence_frames = 0
         SILENCE_THRESHOLD = 25   # ~500ms of silence at 20ms frames
@@ -122,13 +127,16 @@ class ExotelHandler:
 
         async def send_greeting_if_needed():
             nonlocal greeting_sent, stream_sid
+            if not stream_sid:
+                logger.info("[AI_GREETING] Waiting for stream_sid before sending greeting.")
+                return
             if not greeting_sent:
                 greeting_sent = True
                 greeting_text = await self.voice_agent.generate_greeting()
                 logger.info(f"[AI_GREETING] Synthesizing greeting: \"{greeting_text}\"")
-                audio_greeting = await self.voice_agent.text_to_speech(greeting_text, format_type="mulaw")
+                audio_greeting = await self.voice_agent.text_to_speech(greeting_text, format_type=audio_format)
                 if audio_greeting:
-                    asyncio.create_task(self.send_audio_chunks(websocket, stream_sid or "", audio_greeting))
+                    asyncio.create_task(self.send_audio_chunks(websocket, stream_sid, audio_greeting, audio_format))
 
         try:
             while True:
@@ -136,23 +144,39 @@ class ExotelHandler:
                 data = json.loads(message)
                 event = data.get("event")
 
-                # Extract streamSid and callSid from any event
-                incoming_sid = data.get("streamSid") or data.get("stream_sid") or data.get("start", {}).get("streamSid")
+                # Exotel may use snake_case, while browser/tests may use camelCase.
+                start_data = data.get("start", {})
+                media_format = start_data.get("media_format") or data.get("media_format") or {}
+                bit_rate = str(media_format.get("bit_rate", "")).lower()
+                sample_rate = str(media_format.get("sample_rate", ""))
+                if sample_rate == "8000" and "128" in bit_rate:
+                    audio_format = "pcm8"
+                incoming_sid = (
+                    data.get("streamSid")
+                    or data.get("stream_sid")
+                    or start_data.get("streamSid")
+                    or start_data.get("stream_sid")
+                )
                 if incoming_sid:
                     stream_sid = incoming_sid
 
-                incoming_call_sid = data.get("callSid") or data.get("start", {}).get("callSid")
+                incoming_call_sid = (
+                    data.get("callSid")
+                    or data.get("call_sid")
+                    or start_data.get("callSid")
+                    or start_data.get("call_sid")
+                )
                 if incoming_call_sid and incoming_call_sid != "unknown":
                     call_sid = incoming_call_sid
 
                 if event == "connected":
                     protocol = data.get("protocol", "Call")
                     logger.info(f"[WS] Exotel connected (protocol={protocol}) | {data}")
-                    # Trigger greeting immediately on connection
+                    # Exotel sends the usable stream id in the subsequent start event.
                     await send_greeting_if_needed()
 
                 elif event == "start":
-                    logger.info(f"[WS] Stream started: streamSid={stream_sid}, callSid={call_sid} | {data}")
+                    logger.info(f"[WS] Stream started: streamSid={stream_sid}, callSid={call_sid}, audio_format={audio_format} | {data}")
                     if not self.session_manager.get_session(call_sid):
                         self.session_manager.create_session(call_sid)
                     await send_greeting_if_needed()
@@ -169,15 +193,15 @@ class ExotelHandler:
 
                     # If bot is currently speaking, discard echo
                     if self._is_speaking:
-                        mulaw_audio_buffer = b""
+                        audio_buffer = b""
                         speech_started = False
                         silence_frames = 0
                         continue
 
-                    # Decode base64 μ-law chunk
+                    # Decode Exotel base64 audio chunk.
                     try:
-                        mulaw_chunk = base64.b64decode(payload)
-                        pcm_chunk = audioop.ulaw2lin(mulaw_chunk, 2)
+                        audio_chunk = base64.b64decode(payload)
+                        pcm_chunk = audio_chunk if audio_format == "pcm8" else audioop.ulaw2lin(audio_chunk, 2)
                     except Exception:
                         continue
 
@@ -187,29 +211,29 @@ class ExotelHandler:
                     if energy > ENERGY_THRESHOLD:
                         if not speech_started:
                             speech_started = True
-                            mulaw_audio_buffer = mulaw_chunk
+                            audio_buffer = audio_chunk
                             logger.info(f"[VAD] Caller speaking (energy={energy:.0f})...")
                         else:
-                            mulaw_audio_buffer += mulaw_chunk
+                            audio_buffer += audio_chunk
                         silence_frames = 0
                     else:
                         if speech_started:
-                            mulaw_audio_buffer += mulaw_chunk
+                            audio_buffer += audio_chunk
                             silence_frames += 1
 
                             if silence_frames >= SILENCE_THRESHOLD:
                                 speech_started = False
                                 silence_frames = 0
-                                logger.info(f"[VAD] Speech ended. Buffer: {len(mulaw_audio_buffer)} bytes. Processing STT...")
+                                logger.info(f"[VAD] Speech ended. Buffer: {len(audio_buffer)} bytes {audio_format}. Processing STT...")
 
-                                if len(mulaw_audio_buffer) >= 1600:  # at least ~200ms of speech
-                                    utterance = mulaw_audio_buffer
-                                    mulaw_audio_buffer = b""
+                                if len(audio_buffer) >= 1600:  # at least ~200ms of speech
+                                    utterance = audio_buffer
+                                    audio_buffer = b""
                                     asyncio.create_task(self._handle_user_utterance(
-                                        websocket, stream_sid or "", call_sid, utterance
+                                        websocket, stream_sid or "", call_sid, utterance, audio_format
                                     ))
                                 else:
-                                    mulaw_audio_buffer = b""
+                                    audio_buffer = b""
 
                 elif event == "mark":
                     mark_name = data.get("mark", {}).get("name")
@@ -234,11 +258,15 @@ class ExotelHandler:
             except Exception:
                 pass
 
-    async def _handle_user_utterance(self, websocket, stream_sid: str, call_sid: str, mulaw_bytes: bytes):
-        """Process recognized speech to AI response and play back in native 8kHz μ-law."""
+    async def _handle_user_utterance(self, websocket, stream_sid: str, call_sid: str, audio_bytes: bytes, audio_format: str):
+        """Process recognized speech to AI response and play back in Exotel's stream format."""
         try:
-            # 1. Native 8kHz μ-law STT
-            text = await self.voice_agent.speech_to_text(mulaw_bytes, is_mulaw=True)
+            # 1. Native 8kHz telephony STT
+            text = await self.voice_agent.speech_to_text(
+                audio_bytes,
+                is_mulaw=(audio_format != "pcm8"),
+                sample_rate=8000,
+            )
             if not text or not text.strip():
                 logger.info("[STT] No clear words recognized.")
                 return
@@ -252,10 +280,10 @@ class ExotelHandler:
             self.session_manager.add_conversation_turn(call_sid, text, ai_text)
             logger.info(f"🤖 [AI AGENT]: \"{ai_text}\"")
 
-            # 3. Native 8kHz μ-law TTS
-            audio_resp = await self.voice_agent.text_to_speech(ai_text, format_type="mulaw")
+            # 3. Native 8kHz telephony TTS
+            audio_resp = await self.voice_agent.text_to_speech(ai_text, format_type=audio_format)
             if audio_resp:
-                await self.send_audio_chunks(websocket, stream_sid, audio_resp)
+                await self.send_audio_chunks(websocket, stream_sid, audio_resp, audio_format)
         except Exception as e:
             logger.error(f"[PIPELINE] Error handling utterance: {e}", exc_info=True)
 

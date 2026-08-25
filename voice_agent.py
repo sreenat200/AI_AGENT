@@ -36,6 +36,7 @@ class VoiceAgent:
 
         # Azure Speech configurations
         self.speech_config_mulaw = None
+        self.speech_config_pcm8 = None
         self.speech_config_pcm = None
 
         if self.speech_key and not self.speech_key.startswith("your_"):
@@ -51,7 +52,18 @@ class VoiceAgent:
                     speechsdk.SpeechSynthesisOutputFormat.Raw8Khz8BitMonoMULaw
                 )
 
-                # 2. Browser Config: 16kHz PCM
+                # 2. Telephony Config: 8kHz PCM
+                self.speech_config_pcm8 = speechsdk.SpeechConfig(
+                    subscription=self.speech_key,
+                    region=self.speech_region
+                )
+                self.speech_config_pcm8.speech_recognition_language = Config.AZURE_STT_LANGUAGE
+                self.speech_config_pcm8.speech_synthesis_voice_name = Config.AZURE_TTS_VOICE
+                self.speech_config_pcm8.set_speech_synthesis_output_format(
+                    speechsdk.SpeechSynthesisOutputFormat.Raw8Khz16BitMonoPcm
+                )
+
+                # 3. Browser Config: 16kHz PCM
                 self.speech_config_pcm = speechsdk.SpeechConfig(
                     subscription=self.speech_key,
                     region=self.speech_region
@@ -66,11 +78,11 @@ class VoiceAgent:
             except Exception as e:
                 logger.error(f"Error configuring Azure Speech SDK: {e}")
 
-    async def speech_to_text(self, audio_bytes: bytes, is_mulaw: bool = True) -> Optional[str]:
+    async def speech_to_text(self, audio_bytes: bytes, is_mulaw: bool = True, sample_rate: int = 16000) -> Optional[str]:
         """
         Convert audio to text using Azure STT REST API.
         If is_mulaw=True: audio is 8kHz 8-bit μ-law (Exotel telephony).
-        If is_mulaw=False: audio is 16kHz 16-bit PCM (Browser).
+        If is_mulaw=False: audio is PCM at sample_rate, resampled to 16kHz for Azure.
         """
         if not self.speech_key or self.speech_key.startswith("your_"):
             logger.warning("[STT] Azure Speech key not configured.")
@@ -81,9 +93,10 @@ class VoiceAgent:
             return None
 
         t0 = time.time()
-        logger.info(f"[STT] Processing audio buffer ({len(audio_bytes)} bytes, format={'MULAW_8K' if is_mulaw else 'PCM_16K'})...")
+        input_format = "MULAW_8K" if is_mulaw else f"PCM_{sample_rate // 1000}K"
+        logger.info(f"[STT] Processing audio buffer ({len(audio_bytes)} bytes, format={input_format})...")
         try:
-            wav_audio = self._wav_16khz_pcm(audio_bytes, is_mulaw)
+            wav_audio = self._wav_16khz_pcm(audio_bytes, is_mulaw, sample_rate)
             endpoint = self._stt_endpoint()
 
             async with httpx.AsyncClient(timeout=15.0) as client:
@@ -129,10 +142,12 @@ class VoiceAgent:
             return f"{Config.AZURE_SPEECH_ENDPOINT}/stt/speech/recognition/conversation/cognitiveservices/v1"
         return f"https://{self.speech_region}.stt.speech.microsoft.com/speech/recognition/conversation/cognitiveservices/v1"
 
-    def _wav_16khz_pcm(self, audio_bytes: bytes, is_mulaw: bool) -> bytes:
+    def _wav_16khz_pcm(self, audio_bytes: bytes, is_mulaw: bool, sample_rate: int = 16000) -> bytes:
         if is_mulaw:
             pcm_8k = audioop.ulaw2lin(audio_bytes, 2)
             pcm_16k, _ = audioop.ratecv(pcm_8k, 2, 1, 8000, 16000, None)
+        elif sample_rate != 16000:
+            pcm_16k, _ = audioop.ratecv(audio_bytes, 2, 1, sample_rate, 16000, None)
         else:
             pcm_16k = audio_bytes
 
@@ -148,9 +163,15 @@ class VoiceAgent:
         """
         Convert text to audio using Azure TTS.
         format_type='mulaw': Raw 8kHz 8-bit μ-law for Exotel telephony.
+        format_type='pcm8': Raw 8kHz 16-bit PCM for Exotel streams that request 128kbps.
         format_type='pcm': Raw 16kHz 16-bit PCM for Browser testing.
         """
-        config = self.speech_config_mulaw if format_type == "mulaw" else self.speech_config_pcm
+        if format_type == "mulaw":
+            config = self.speech_config_mulaw
+        elif format_type == "pcm8":
+            config = self.speech_config_pcm8
+        else:
+            config = self.speech_config_pcm
         if not config:
             logger.warning("[TTS] Azure Speech Config not initialized.")
             return b""
