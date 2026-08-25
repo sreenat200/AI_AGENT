@@ -5,7 +5,7 @@ import logging
 import audioop
 import asyncio
 import time
-from typing import Optional
+from typing import Awaitable, Callable, Optional
 from voice_agent import VoiceAgent
 from session_manager import SessionManager
 from config import Config
@@ -122,8 +122,37 @@ class ExotelHandler:
         silence_frames = 0
         SILENCE_THRESHOLD = 25   # ~500ms of silence at 20ms frames
         ENERGY_THRESHOLD = 250    # Sensitive speech activity threshold
+        BARGE_IN_THRESHOLD = 800  # Caller speech level required to interrupt playback
         greeting_sent = False
-        self._is_speaking = False
+        is_speaking = False
+        playback_task: Optional[asyncio.Task] = None
+        utterance_task: Optional[asyncio.Task] = None
+
+        async def cancel_task(task: Optional[asyncio.Task], label: str):
+            if task and not task.done():
+                logger.info(f"[{label}] Canceling previous task.")
+                task.cancel()
+                try:
+                    await task
+                except asyncio.CancelledError:
+                    pass
+
+        async def start_playback(audio_bytes: bytes):
+            nonlocal is_speaking, playback_task
+            await cancel_task(playback_task, "MEDIA_OUT")
+
+            current_stream_sid = stream_sid
+            current_audio_format = audio_format
+
+            async def run_playback():
+                nonlocal is_speaking
+                is_speaking = True
+                try:
+                    await self.send_audio_chunks(websocket, current_stream_sid or "", audio_bytes, current_audio_format)
+                finally:
+                    is_speaking = False
+
+            playback_task = asyncio.create_task(run_playback())
 
         async def send_greeting_if_needed():
             nonlocal greeting_sent, stream_sid
@@ -136,7 +165,7 @@ class ExotelHandler:
                 logger.info(f"[AI_GREETING] Synthesizing greeting: \"{greeting_text}\"")
                 audio_greeting = await self.voice_agent.text_to_speech(greeting_text, format_type=audio_format)
                 if audio_greeting:
-                    asyncio.create_task(self.send_audio_chunks(websocket, stream_sid, audio_greeting, audio_format))
+                    await start_playback(audio_greeting)
 
         try:
             while True:
@@ -191,13 +220,6 @@ class ExotelHandler:
                     if not greeting_sent:
                         await send_greeting_if_needed()
 
-                    # If bot is currently speaking, discard echo
-                    if self._is_speaking:
-                        audio_buffer = b""
-                        speech_started = False
-                        silence_frames = 0
-                        continue
-
                     # Decode Exotel base64 audio chunk.
                     try:
                         audio_chunk = base64.b64decode(payload)
@@ -207,6 +229,20 @@ class ExotelHandler:
 
                     # Energy calculation for Voice Activity Detection
                     energy = self._audio_energy(pcm_chunk)
+
+                    if is_speaking:
+                        if energy < BARGE_IN_THRESHOLD:
+                            audio_buffer = b""
+                            speech_started = False
+                            silence_frames = 0
+                            continue
+
+                        logger.info(f"[BARGE_IN] Caller interrupted playback (energy={energy:.0f}).")
+                        await cancel_task(playback_task, "MEDIA_OUT")
+                        speech_started = True
+                        audio_buffer = audio_chunk
+                        silence_frames = 0
+                        continue
 
                     if energy > ENERGY_THRESHOLD:
                         if not speech_started:
@@ -229,8 +265,9 @@ class ExotelHandler:
                                 if len(audio_buffer) >= 1600:  # at least ~200ms of speech
                                     utterance = audio_buffer
                                     audio_buffer = b""
-                                    asyncio.create_task(self._handle_user_utterance(
-                                        websocket, stream_sid or "", call_sid, utterance, audio_format
+                                    await cancel_task(utterance_task, "PIPELINE")
+                                    utterance_task = asyncio.create_task(self._handle_user_utterance(
+                                        websocket, stream_sid or "", call_sid, utterance, audio_format, start_playback
                                     ))
                                 else:
                                     audio_buffer = b""
@@ -251,6 +288,8 @@ class ExotelHandler:
             logger.error(f"[WS] Error in media stream session: {e}", exc_info=True)
         finally:
             logger.info(f"[WS] Closing session for call: {call_sid}")
+            await cancel_task(playback_task, "MEDIA_OUT")
+            await cancel_task(utterance_task, "PIPELINE")
             self.session_manager.end_session(call_sid)
             self._is_speaking = False
             try:
@@ -258,7 +297,15 @@ class ExotelHandler:
             except Exception:
                 pass
 
-    async def _handle_user_utterance(self, websocket, stream_sid: str, call_sid: str, audio_bytes: bytes, audio_format: str):
+    async def _handle_user_utterance(
+        self,
+        websocket,
+        stream_sid: str,
+        call_sid: str,
+        audio_bytes: bytes,
+        audio_format: str,
+        play_audio: Optional[Callable[[bytes], Awaitable[None]]] = None,
+    ):
         """Process recognized speech to AI response and play back in Exotel's stream format."""
         try:
             # 1. Native 8kHz telephony STT
@@ -283,7 +330,10 @@ class ExotelHandler:
             # 3. Native 8kHz telephony TTS
             audio_resp = await self.voice_agent.text_to_speech(ai_text, format_type=audio_format)
             if audio_resp:
-                await self.send_audio_chunks(websocket, stream_sid, audio_resp, audio_format)
+                if play_audio:
+                    await play_audio(audio_resp)
+                else:
+                    await self.send_audio_chunks(websocket, stream_sid, audio_resp, audio_format)
         except Exception as e:
             logger.error(f"[PIPELINE] Error handling utterance: {e}", exc_info=True)
 
