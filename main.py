@@ -23,7 +23,7 @@ logger = logging.getLogger("voice_app")
 # Validate environment
 Config.validate()
 
-app = FastAPI(title="AI Voice Agent Backend (Exotel + Azure + OpenRouter)")
+app = FastAPI(title="AI Voice Agent Backend (Exotel + Deepgram / Azure + OpenRouter)")
 app.mount("/static", StaticFiles(directory="static"), name="static")
 app.add_middleware(
     CORSMiddleware,
@@ -70,8 +70,11 @@ async def health():
     return {
         "status": "healthy",
         "active_sessions": session_manager.active_count(),
-        "exotel_configured": bool(Config.EXOTEL_ACCOUNT_SID and Config.EXOTEL_API_KEY),
+        "stt_provider": Config.STT_PROVIDER,
+        "tts_provider": Config.TTS_PROVIDER,
+        "deepgram_configured": bool(Config.DEEPGRAM_API_KEY and not Config.DEEPGRAM_API_KEY.startswith("your_")),
         "azure_configured": bool(Config.AZURE_SPEECH_KEY and not Config.AZURE_SPEECH_KEY.startswith("your_")),
+        "exotel_configured": bool(Config.EXOTEL_ACCOUNT_SID and Config.EXOTEL_API_KEY),
         "openrouter_configured": bool(Config.OPENROUTER_API_KEY and not Config.OPENROUTER_API_KEY.startswith("your_")),
         "openrouter_model": Config.OPENROUTER_MODEL,
         "streaming_mode": Config.EXOTEL_USE_STREAM

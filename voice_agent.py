@@ -17,9 +17,23 @@ logger = logging.getLogger(__name__)
 
 class VoiceAgent:
     def __init__(self):
+        self.stt_provider = Config.STT_PROVIDER
+        self.tts_provider = Config.TTS_PROVIDER
+
+        self.deepgram_key = Config.DEEPGRAM_API_KEY
         self.speech_key = Config.AZURE_SPEECH_KEY
         self.speech_region = Config.AZURE_SPEECH_REGION
         self.system_prompt = Config.SYSTEM_PROMPT
+
+        self.has_deepgram = bool(self.deepgram_key and not self.deepgram_key.startswith("your_"))
+        self.has_azure = bool(self.speech_key and not self.speech_key.startswith("your_"))
+
+        self._http_client: Optional[httpx.AsyncClient] = None
+
+        logger.info(
+            f"Speech Providers: STT='{self.stt_provider}', TTS='{self.tts_provider}' "
+            f"(Deepgram={self.has_deepgram}, Azure={self.has_azure})"
+        )
 
         # OpenRouter / OpenAI client initialization
         self.llm_client = None
@@ -39,7 +53,7 @@ class VoiceAgent:
         self.speech_config_pcm8 = None
         self.speech_config_pcm = None
 
-        if self.speech_key and not self.speech_key.startswith("your_"):
+        if self.has_azure:
             try:
                 # 1. Telephony Config: 8kHz μ-law (PCMU)
                 self.speech_config_mulaw = speechsdk.SpeechConfig(
@@ -78,63 +92,149 @@ class VoiceAgent:
             except Exception as e:
                 logger.error(f"Error configuring Azure Speech SDK: {e}")
 
+    @property
+    def http_client(self) -> httpx.AsyncClient:
+        if self._http_client is None or self._http_client.is_closed:
+            self._http_client = httpx.AsyncClient(timeout=15.0)
+        return self._http_client
+
+    async def close(self):
+        if self._http_client and not self._http_client.is_closed:
+            await self._http_client.aclose()
+
+    # ----------------------- Speech-to-Text (STT) -----------------------
+
     async def speech_to_text(self, audio_bytes: bytes, is_mulaw: bool = True, sample_rate: int = 16000) -> Optional[str]:
         """
-        Convert audio to text using Azure STT REST API.
+        Convert audio to text using configured provider (Deepgram or Azure).
         If is_mulaw=True: audio is 8kHz 8-bit μ-law (Exotel telephony).
-        If is_mulaw=False: audio is PCM at sample_rate, resampled to 16kHz for Azure.
+        If is_mulaw=False: audio is linear PCM at sample_rate (e.g., 8kHz or 16kHz).
         """
-        if not self.speech_key or self.speech_key.startswith("your_"):
-            logger.warning("[STT] Azure Speech key not configured.")
-            return None
-
         if not audio_bytes:
             logger.debug("[STT] Empty audio buffer.")
             return None
 
+        # Deepgram primary / configured
+        if self.stt_provider == "deepgram" and self.has_deepgram:
+            text = await self._deepgram_stt(audio_bytes, is_mulaw, sample_rate)
+            if text:
+                return text
+            if self.has_azure:
+                logger.info("[STT] Deepgram returned no transcript; trying Azure fallback...")
+                return await self._azure_stt(audio_bytes, is_mulaw, sample_rate)
+            return None
+
+        # Azure primary
+        if self.stt_provider == "azure" and self.has_azure:
+            text = await self._azure_stt(audio_bytes, is_mulaw, sample_rate)
+            if text:
+                return text
+            if self.has_deepgram:
+                logger.info("[STT] Azure returned no transcript; trying Deepgram fallback...")
+                return await self._deepgram_stt(audio_bytes, is_mulaw, sample_rate)
+            return None
+
+        # Auto fallback if provider not explicitly matched
+        if self.has_deepgram:
+            return await self._deepgram_stt(audio_bytes, is_mulaw, sample_rate)
+        elif self.has_azure:
+            return await self._azure_stt(audio_bytes, is_mulaw, sample_rate)
+
+        logger.warning("[STT] No speech-to-text provider configured (neither Deepgram nor Azure).")
+        return None
+
+    async def _deepgram_stt(self, audio_bytes: bytes, is_mulaw: bool = True, sample_rate: int = 16000) -> Optional[str]:
+        """Convert audio to text using Deepgram REST API (Nova-2)."""
         t0 = time.time()
         input_format = "MULAW_8K" if is_mulaw else f"PCM_{sample_rate // 1000}K"
-        logger.info(f"[STT] Processing audio buffer ({len(audio_bytes)} bytes, format={input_format})...")
+        logger.info(f"[STT-Deepgram] Processing audio buffer ({len(audio_bytes)} bytes, format={input_format})...")
+
+        url = "https://api.deepgram.com/v1/listen"
+        params = {
+            "model": Config.DEEPGRAM_STT_MODEL,
+            "language": Config.DEEPGRAM_STT_LANGUAGE,
+            "smart_format": "true",
+            "punctuate": "true",
+            "channels": "1",
+        }
+        if is_mulaw:
+            params["encoding"] = "mulaw"
+            params["sample_rate"] = "8000"
+        else:
+            params["encoding"] = "linear16"
+            params["sample_rate"] = str(sample_rate)
+
+        headers = {
+            "Authorization": f"Token {self.deepgram_key}",
+            "Content-Type": "audio/raw",
+        }
+
+        try:
+            response = await self.http_client.post(url, params=params, headers=headers, content=audio_bytes)
+            elapsed = (time.time() - t0) * 1000
+
+            if response.status_code != 200:
+                logger.warning(f"[STT-Deepgram] Failed ({response.status_code}, {elapsed:.0f}ms): {response.text[:300]}")
+                return None
+
+            payload = response.json()
+            channels = payload.get("results", {}).get("channels", [])
+            if channels and channels[0].get("alternatives"):
+                transcript = channels[0]["alternatives"][0].get("transcript", "").strip()
+                if transcript:
+                    logger.info(f"[STT-Deepgram] Recognized text ({elapsed:.0f}ms): \"{transcript}\"")
+                    return transcript
+
+            logger.debug(f"[STT-Deepgram] No speech recognized ({elapsed:.0f}ms)")
+            return None
+        except Exception as e:
+            logger.error(f"[STT-Deepgram] Error during recognition: {e}", exc_info=True)
+            return None
+
+    async def _azure_stt(self, audio_bytes: bytes, is_mulaw: bool = True, sample_rate: int = 16000) -> Optional[str]:
+        """Convert audio to text using Azure STT REST API."""
+        t0 = time.time()
+        input_format = "MULAW_8K" if is_mulaw else f"PCM_{sample_rate // 1000}K"
+        logger.info(f"[STT-Azure] Processing audio buffer ({len(audio_bytes)} bytes, format={input_format})...")
         try:
             wav_audio = self._wav_16khz_pcm(audio_bytes, is_mulaw, sample_rate)
             endpoint = self._stt_endpoint()
 
-            async with httpx.AsyncClient(timeout=15.0) as client:
-                response = await client.post(
-                    endpoint,
-                    params={"language": Config.AZURE_STT_LANGUAGE, "format": "simple"},
-                    headers={
-                        "Ocp-Apim-Subscription-Key": self.speech_key,
-                        "Content-Type": "audio/wav; codecs=audio/pcm; samplerate=16000",
-                        "Accept": "application/json",
-                    },
-                    content=wav_audio,
-                )
+            response = await self.http_client.post(
+                endpoint,
+                params={"language": Config.AZURE_STT_LANGUAGE, "format": "simple"},
+                headers={
+                    "Ocp-Apim-Subscription-Key": self.speech_key,
+                    "Content-Type": "audio/wav; codecs=audio/pcm; samplerate=16000",
+                    "Accept": "application/json",
+                },
+                content=wav_audio,
+            )
 
             elapsed = (time.time() - t0) * 1000
 
             if response.status_code == 401:
-                logger.warning("[STT] Azure REST auth failed (401). Check AZURE_SPEECH_KEY and AZURE_SPEECH_REGION.")
+                logger.warning("[STT-Azure] Auth failed (401). Check AZURE_SPEECH_KEY and AZURE_SPEECH_REGION.")
                 return None
             if response.status_code >= 400:
-                logger.warning(f"[STT] Azure REST failed ({response.status_code}, {elapsed:.0f}ms): {response.text[:300]}")
+                logger.warning(f"[STT-Azure] Failed ({response.status_code}, {elapsed:.0f}ms): {response.text[:300]}")
                 return None
 
             payload = response.json()
             if payload.get("RecognitionStatus") == "Success" and payload.get("DisplayText"):
                 text = payload["DisplayText"]
-                logger.info(f"[STT] Recognized text ({elapsed:.0f}ms): \"{text}\"")
+                logger.info(f"[STT-Azure] Recognized text ({elapsed:.0f}ms): \"{text}\"")
                 return text
 
             status = payload.get("RecognitionStatus")
             if status in ("NoMatch", "InitialSilenceTimeout", "BabbleTimeout"):
-                logger.debug(f"[STT] No speech recognized ({elapsed:.0f}ms): {status}")
+                logger.debug(f"[STT-Azure] No speech recognized ({elapsed:.0f}ms): {status}")
                 return None
 
-            logger.warning(f"[STT] Recognition failed ({elapsed:.0f}ms): {payload}")
+            logger.warning(f"[STT-Azure] Recognition failed ({elapsed:.0f}ms): {payload}")
             return None
         except Exception as e:
-            logger.error(f"[STT] Error during recognition: {e}", exc_info=True)
+            logger.error(f"[STT-Azure] Error during recognition: {e}", exc_info=True)
             return None
 
     def _stt_endpoint(self) -> str:
@@ -159,43 +259,130 @@ class VoiceAgent:
             wav_file.writeframes(pcm_16k)
         return wav_buffer.getvalue()
 
+    # ----------------------- Text-to-Speech (TTS) -----------------------
+
     async def text_to_speech(self, text: str, format_type: str = "mulaw") -> bytes:
         """
-        Convert text to audio using Azure TTS.
+        Convert text to audio using configured provider (Deepgram Aura or Azure).
         format_type='mulaw': Raw 8kHz 8-bit μ-law for Exotel telephony.
         format_type='pcm8': Raw 8kHz 16-bit PCM for Exotel streams that request 128kbps.
         format_type='pcm': Raw 16kHz 16-bit PCM for Browser testing.
         """
+        if not text or not text.strip():
+            return b""
+
+        # Deepgram primary / configured
+        if self.tts_provider == "deepgram" and self.has_deepgram:
+            audio = await self._deepgram_tts(text, format_type)
+            if audio:
+                return audio
+            if self.has_azure:
+                logger.info("[TTS] Deepgram synthesis failed; trying Azure fallback...")
+                return await self._azure_tts(text, format_type)
+            return b""
+
+        # Azure primary
+        if self.tts_provider == "azure" and self.has_azure:
+            audio = await self._azure_tts(text, format_type)
+            if audio:
+                return audio
+            if self.has_deepgram:
+                logger.info("[TTS] Azure synthesis failed; trying Deepgram fallback...")
+                return await self._deepgram_tts(text, format_type)
+            return b""
+
+        # Auto fallback
+        if self.has_deepgram:
+            return await self._deepgram_tts(text, format_type)
+        elif self.has_azure:
+            return await self._azure_tts(text, format_type)
+
+        logger.warning("[TTS] No text-to-speech provider configured (neither Deepgram nor Azure).")
+        return b""
+
+    async def _deepgram_tts(self, text: str, format_type: str = "mulaw") -> bytes:
+        """Convert text to audio using Deepgram Aura TTS API."""
+        t0 = time.time()
+        logger.info(f"[TTS-Deepgram] Synthesizing ({format_type}): \"{text[:80]}{'...' if len(text) > 80 else ''}\"")
+
+        url = "https://api.deepgram.com/v1/speak"
+        if format_type == "mulaw":
+            params = {
+                "model": Config.DEEPGRAM_TTS_MODEL,
+                "encoding": "mulaw",
+                "sample_rate": "8000",
+                "container": "none",
+            }
+        elif format_type == "pcm8":
+            params = {
+                "model": Config.DEEPGRAM_TTS_MODEL,
+                "encoding": "linear16",
+                "sample_rate": "8000",
+                "container": "none",
+            }
+        else:  # "pcm" (16kHz PCM for browser)
+            params = {
+                "model": Config.DEEPGRAM_TTS_MODEL,
+                "encoding": "linear16",
+                "sample_rate": "16000",
+                "container": "none",
+            }
+
+        headers = {
+            "Authorization": f"Token {self.deepgram_key}",
+            "Content-Type": "application/json",
+        }
+
+        try:
+            response = await self.http_client.post(url, params=params, headers=headers, json={"text": text})
+            elapsed = (time.time() - t0) * 1000
+
+            if response.status_code != 200:
+                logger.error(f"[TTS-Deepgram] Synthesis failed ({response.status_code}, {elapsed:.0f}ms): {response.text[:300]}")
+                return b""
+
+            audio_data = response.content
+            logger.info(f"[TTS-Deepgram] Synthesized {len(audio_data)} bytes {format_type} ({elapsed:.0f}ms)")
+            return audio_data
+        except Exception as e:
+            logger.error(f"[TTS-Deepgram] Error during synthesis: {e}", exc_info=True)
+            return b""
+
+    async def _azure_tts(self, text: str, format_type: str = "mulaw") -> bytes:
+        """Convert text to audio using Azure TTS."""
         if format_type == "mulaw":
             config = self.speech_config_mulaw
         elif format_type == "pcm8":
             config = self.speech_config_pcm8
         else:
             config = self.speech_config_pcm
+
         if not config:
-            logger.warning("[TTS] Azure Speech Config not initialized.")
+            logger.warning("[TTS-Azure] Azure Speech Config not initialized.")
             return b""
 
         t0 = time.time()
-        logger.info(f"[TTS] Synthesizing ({format_type}): \"{text[:80]}{'...' if len(text) > 80 else ''}\"")
+        logger.info(f"[TTS-Azure] Synthesizing ({format_type}): \"{text[:80]}{'...' if len(text) > 80 else ''}\"")
         try:
             synthesizer = speechsdk.SpeechSynthesizer(speech_config=config, audio_config=None)
             result = await asyncio.to_thread(synthesizer.speak_text_async(text).get)
             elapsed = (time.time() - t0) * 1000
 
             if result.reason == speechsdk.ResultReason.SynthesizingAudioCompleted:
-                logger.info(f"[TTS] Synthesized {len(result.audio_data)} bytes {format_type} ({elapsed:.0f}ms)")
+                logger.info(f"[TTS-Azure] Synthesized {len(result.audio_data)} bytes {format_type} ({elapsed:.0f}ms)")
                 return result.audio_data
             elif result.reason == speechsdk.ResultReason.Canceled:
                 cancellation_details = speechsdk.CancellationDetails(result)
-                logger.error(f"[TTS] Canceled: reason={cancellation_details.reason}, error_details={cancellation_details.error_details}")
+                logger.error(f"[TTS-Azure] Canceled: reason={cancellation_details.reason}, error_details={cancellation_details.error_details}")
                 return b""
             else:
-                logger.error(f"[TTS] Synthesis failed ({elapsed:.0f}ms): {result.reason}")
+                logger.error(f"[TTS-Azure] Synthesis failed ({elapsed:.0f}ms): {result.reason}")
                 return b""
         except Exception as e:
-            logger.error(f"[TTS] Error during synthesis: {e}", exc_info=True)
+            logger.error(f"[TTS-Azure] Error during synthesis: {e}", exc_info=True)
             return b""
+
+    # ----------------------- LLM Response Generation -----------------------
 
     async def generate_response(
         self,
